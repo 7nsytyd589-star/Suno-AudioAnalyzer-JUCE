@@ -19,6 +19,10 @@ public:
     void resized() override;
 
 private:
+    //
+    juce::Label diffHeaderLabel;
+    std::array<juce::Label, 8> diffValueLabels;
+    //
     AudioPluginAudioProcessor& processorRef;
 
     juce::Label titleLabel;

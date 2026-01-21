@@ -13,6 +13,14 @@
 class AudioPluginAudioProcessor final : public juce::AudioProcessor
 {
 public:
+    
+    // Compare 功能
+    void performCompare();
+    std::array<float, 8> getDiffArray() const;
+    juce::String getCompareResultText() const;
+    
+    //==============================================================================
+    
         bool isTargetReady() const;
 
         void beginCaptureSeconds (double seconds);
@@ -68,7 +76,10 @@ private:
     
     // ====== UI: Two-column table ======
 
-
+//
+    // Compare 结果缓存
+    std::array<std::atomic<float>, 8> diffValues;
+    juce::String compareResultText { "" };
 
 
 //

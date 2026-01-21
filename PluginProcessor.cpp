@@ -72,6 +72,10 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 {
     for (auto& a : currentEnvAtomic) a.store (0.0f, std::memory_order_relaxed);
     for (auto& a : current01)        a.store (0.0f, std::memory_order_relaxed);
+    //引索循环
+    for (int i = 0; i < 8; ++i)
+            diffValues[i].store(0.0f, std::memory_order_relaxed);
+    
     targetReady.store (false);
 }
 
@@ -120,6 +124,89 @@ std::array<float, 8> AudioPluginAudioProcessor::getCurrentProfileArray() const
     for (int i = 0; i < 8; ++i)
         out[i] = current01[i].load(std::memory_order_relaxed);   // 关键：load atomic
     return out;
+}
+
+// 1. isTargetReady() - 检查是否已捕获目标音色
+bool AudioPluginAudioProcessor::isTargetReady() const
+{
+    return targetReady.load();
+}
+
+// 2. getDiff() - 获取第 index 个维度的差值 (target - current)
+float AudioPluginAudioProcessor::getDiff(int index) const
+{
+    if (index < 0 || index >= 8)
+        return 0.0f;
+    
+    auto targetArr = targetProfile.toArray();
+    float currentVal = current01[index].load(std::memory_order_relaxed);
+    
+    return targetArr[index] - currentVal;
+    
+}
+
+// 3. getSuggestionA() - 获取差异最大的维度索引（最需要调整的）
+int AudioPluginAudioProcessor::getSuggestionA() const
+{
+    if (!targetReady.load())
+        return -1;
+    
+    auto targetArr = targetProfile.toArray();
+    
+    int maxIndex = 0;
+    float maxDiff = 0.0f;
+    
+    for (int i = 0; i < 8; ++i)
+    {
+        float currentVal = current01[i].load(std::memory_order_relaxed);
+        float absDiff = std::abs(targetArr[i] - currentVal);
+        
+        if (absDiff > maxDiff)
+        {
+            maxDiff = absDiff;
+            maxIndex = i;
+        }
+    }
+    
+    return maxIndex;
+}
+
+// 4. getSuggestionB() - 获取差异第二大的维度索引
+int AudioPluginAudioProcessor::getSuggestionB() const
+{
+    if (!targetReady.load())
+        return -1;
+    
+    auto targetArr = targetProfile.toArray();
+    
+    int firstIndex = -1;
+    int secondIndex = -1;
+    float firstDiff = 0.0f;
+    float secondDiff = 0.0f;
+    
+    for (int i = 0; i < 8; ++i)
+    {
+        float currentVal = current01[i].load(std::memory_order_relaxed);
+        float absDiff = std::abs(targetArr[i] - currentVal);
+        
+        if (absDiff > firstDiff)
+        {
+            // 原来的第一名变成第二名
+            secondDiff = firstDiff;
+            secondIndex = firstIndex;
+            // 更新第一名
+            firstDiff = absDiff;
+            firstIndex = i;
+        }
+        else if (absDiff > secondDiff)
+        {
+            // 更新第二名
+            secondDiff = absDiff;
+            secondIndex = i;
+        }
+    }
+    
+    return secondIndex;
 }
 
 std::array<float, 8> AudioPluginAudioProcessor::getTargetProfileArray() const
@@ -461,3 +548,73 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new AudioPluginAudioProcessor();
 }
+
+
+// 执行比较分析
+void AudioPluginAudioProcessor::performCompare()
+{
+    if (!targetReady.load())
+    {
+        compareResultText = "No target captured yet!";
+        return;
+    }
+    
+    auto targetArr = targetProfile.toArray();
+    
+    // 计算每个维度的差值
+    for (int i = 0; i < 8; ++i)
+    {
+        float currentVal = current01[i].load(std::memory_order_relaxed);
+        float diff = targetArr[i] - currentVal;
+        diffValues[i].store(diff, std::memory_order_relaxed);
+    }
+    
+    // 获取建议
+    int suggA = getSuggestionA();
+    int suggB = getSuggestionB();
+    
+    static const char* dimNames[8] = {
+        "Bright", "Body", "Bite", "Air", "Noise", "Width", "Motion", "Space"
+    };
+    
+    juce::String result;
+    
+    if (suggA >= 0)
+    {
+        float diffA = diffValues[suggA].load();
+        juce::String directionA = (diffA > 0) ? "increase" : "decrease";
+        result += "1. " + juce::String(dimNames[suggA]) + ": " + directionA + " by " + juce::String(std::abs(diffA), 2);
+    }
+    
+    if (suggB >= 0)
+    {
+        float diffB = diffValues[suggB].load();
+        juce::String directionB = (diffB > 0) ? "increase" : "decrease";
+        result += "\n2. " + juce::String(dimNames[suggB]) + ": " + directionB + " by " + juce::String(std::abs(diffB), 2);
+    }
+    
+    if (result.isEmpty())
+        result = "Sounds matched!";
+    
+    compareResultText = result;
+}
+
+// 获取差值数组供 UI 使用
+std::array<float, 8> AudioPluginAudioProcessor::getDiffArray() const
+{
+    std::array<float, 8> out{};
+    for (int i = 0; i < 8; ++i)
+        out[i] = diffValues[i].load(std::memory_order_relaxed);
+    return out;
+}
+
+// 获取比较结果文字
+juce::String AudioPluginAudioProcessor::getCompareResultText() const
+{
+    return compareResultText;
+}
+
+
+
+
+
