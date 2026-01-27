@@ -1,63 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
-AudioPluginAudioProcessor::TimbreProfile
-AudioPluginAudioProcessor::analyseBufferToProfile (const juce::AudioBuffer<float>& monoBuffer,
-                                                   double sampleRate)
-{
-    juce::ignoreUnused (sampleRate);
 
-    TimbreProfile p;
-
-    if (monoBuffer.getNumSamples() <= 0)
-        return p;
-
-    // Reuse the simple RMS-based mock analysis so the target column updates
-    const float rms = monoBuffer.getRMSLevel (0, 0, monoBuffer.getNumSamples());
-    const float mockValue = juce::jlimit (0.0f, 1.0f, rms * 5.0f);
-
-    p.bright = mockValue;
-    p.body   = mockValue * 0.8f;
-    p.bite   = mockValue * 1.2f;
-    p.air    = mockValue * 0.5f;
-    p.noise  = mockValue * 0.5f;
-    p.width  = mockValue * 0.5f;
-    p.motion = mockValue * 0.5f;
-    p.space  = mockValue * 0.5f;
-
-    return p;
-}
-
-
-AudioPluginAudioProcessor::TimbreProfile
-AudioPluginAudioProcessor::analyseCurrentBlockToProfile (const juce::AudioBuffer<float>& buffer,
-                                                         double sampleRate)
-{
-    juce::ignoreUnused (sampleRate);
-
-    TimbreProfile p;
-
-    if (buffer.getNumSamples() <= 0)
-        return p;
-
-    // Use channel 0 for a quick mock analysis, similar to analyseBufferToProfile
-    const float rms = buffer.getRMSLevel (0, 0, buffer.getNumSamples());
-    const float mockValue = juce::jlimit (0.0f, 1.0f, rms * 5.0f);
-
-    p.bright = mockValue;
-    p.body   = mockValue * 0.8f;
-    p.bite   = mockValue * 1.2f;
-    p.air    = mockValue * 0.5f;
-    p.noise  = mockValue * 0.5f;
-    p.width  = mockValue * 0.5f;
-    p.motion = mockValue * 0.5f;
-    p.space  = mockValue * 0.5f;
-
-    return p;
-}
-
-
-
-//==============================================================================
 AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 #ifndef JucePlugin_PreferredChannelConfigurations
      : AudioProcessor (BusesProperties()
@@ -72,14 +15,284 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 {
     for (auto& a : currentEnvAtomic) a.store (0.0f, std::memory_order_relaxed);
     for (auto& a : current01)        a.store (0.0f, std::memory_order_relaxed);
-    //引索循环
     for (int i = 0; i < 8; ++i)
-            diffValues[i].store(0.0f, std::memory_order_relaxed);
+        diffValues[i].store(0.0f, std::memory_order_relaxed);
     
     targetReady.store (false);
+    
+    // 音色分析初始化
+    hasPreviousFrame = false;
+    previousFrameEnergy.fill (0.0f);
 }
 
 
+AudioPluginAudioProcessor::TimbreProfile
+AudioPluginAudioProcessor::analyseBufferToProfile (const juce::AudioBuffer<float>& monoBuffer,
+                                                   double sampleRate)
+{
+    TimbreProfile p;
+    
+    if (monoBuffer.getNumSamples() <= 0)
+        return p;
+    
+    const int analysisFFTSize = 4096;
+    const int analysisFFTOrder = 12;
+    juce::dsp::FFT analysisFFT (analysisFFTOrder);
+    juce::dsp::WindowingFunction<float> analysisWindow (
+        (size_t) analysisFFTSize,
+        juce::dsp::WindowingFunction<float>::hann
+    );
+    
+    std::vector<float> fftWorkBuffer ((size_t) analysisFFTSize * 2, 0.0f);
+    
+    const float* inputData = monoBuffer.getReadPointer (0);
+    const int numSamples = monoBuffer.getNumSamples();
+    const int hopSize = analysisFFTSize / 2;
+    const int nyquistBin = analysisFFTSize / 2;
+    const float epsilon = 1e-10f;
+    
+    // 频率 bin 边界
+    auto freqToBin = [&](float hz) {
+        return (int) std::round (hz * (float) analysisFFTSize / (float) sampleRate);
+    };
+    
+    const int brightStartBin = freqToBin (4000.0f);
+    const int bodyStartBin   = freqToBin (100.0f);
+    const int bodyEndBin     = freqToBin (500.0f);
+    const int biteStartBin   = freqToBin (1000.0f);
+    const int biteEndBin     = freqToBin (4000.0f);
+    const int airStartBin    = freqToBin (8000.0f);
+    
+    float totalBright = 0.0f;
+    float totalBody = 0.0f;
+    float totalBite = 0.0f;
+    float totalAir = 0.0f;
+    float totalNoise = 0.0f;
+    float totalMotion = 0.0f;
+    int frameCount = 0;
+    
+    std::vector<float> prevFrameMags ((size_t) nyquistBin + 1, 0.0f);
+    bool hasPrevFrame = false;
+    
+    for (int frameStart = 0; frameStart + analysisFFTSize <= numSamples; frameStart += hopSize)
+    {
+        std::fill (fftWorkBuffer.begin(), fftWorkBuffer.end(), 0.0f);
+        for (int i = 0; i < analysisFFTSize; ++i)
+            fftWorkBuffer[(size_t) i] = inputData[frameStart + i];
+        
+        analysisWindow.multiplyWithWindowingTable (fftWorkBuffer.data(), (size_t) analysisFFTSize);
+        analysisFFT.performRealOnlyForwardTransform (fftWorkBuffer.data());
+        
+        float totalEnergy = 0.0f;
+        float brightEnergy = 0.0f;
+        float bodyEnergy = 0.0f;
+        float biteEnergy = 0.0f;
+        float airEnergy = 0.0f;
+        
+        std::vector<float> currentMags ((size_t) nyquistBin + 1, 0.0f);
+        
+        for (int bin = 1; bin <= nyquistBin; ++bin)
+        {
+            float re = fftWorkBuffer[(size_t) bin * 2];
+            float im = fftWorkBuffer[(size_t) bin * 2 + 1];
+            float mag = std::sqrt (re * re + im * im);
+            currentMags[(size_t) bin] = mag;
+            
+            float energy = mag * mag;
+            totalEnergy += energy;
+            
+            if (bin >= brightStartBin)
+                brightEnergy += energy;
+            if (bin >= bodyStartBin && bin <= bodyEndBin)
+                bodyEnergy += energy;
+            if (bin >= biteStartBin && bin <= biteEndBin)
+                biteEnergy += energy;
+            if (bin >= airStartBin)
+                airEnergy += energy;
+        }
+        
+        totalBright += (totalEnergy > epsilon) ? (brightEnergy / totalEnergy) : 0.0f;
+        totalBody += (totalEnergy > epsilon) ? (bodyEnergy / totalEnergy) : 0.0f;
+        totalBite += (totalEnergy > epsilon) ? (biteEnergy / totalEnergy) : 0.0f;
+        totalAir += (totalEnergy > epsilon) ? (airEnergy / totalEnergy) : 0.0f;
+        
+        // Noise: 频谱平坦度
+        float sumLog = 0.0f;
+        float sumLinear = 0.0f;
+        for (int bin = 1; bin <= nyquistBin; ++bin)
+        {
+            float mag = currentMags[(size_t) bin] + epsilon;
+            sumLog += std::log (mag);
+            sumLinear += mag;
+        }
+        float geometricMean = std::exp (sumLog / (float) nyquistBin);
+        float arithmeticMean = sumLinear / (float) nyquistBin;
+        totalNoise += (arithmeticMean > epsilon) ? (geometricMean / arithmeticMean) : 0.0f;
+        
+        // Motion: 帧间变化
+        if (hasPrevFrame)
+        {
+            float motionSum = 0.0f;
+            for (int bin = 1; bin <= nyquistBin; ++bin)
+            {
+                float diff = std::abs (currentMags[(size_t) bin] - prevFrameMags[(size_t) bin]);
+                motionSum += diff;
+            }
+            totalMotion += motionSum / (float) nyquistBin;
+        }
+        
+        prevFrameMags = currentMags;
+        hasPrevFrame = true;
+        frameCount++;
+    }
+    
+    if (frameCount > 0)
+    {
+        float invCount = 1.0f / (float) frameCount;
+        
+        p.bright = juce::jlimit (0.0f, 1.0f, totalBright * invCount * 3.0f);
+        p.body   = juce::jlimit (0.0f, 1.0f, totalBody * invCount * 5.0f);
+        p.bite   = juce::jlimit (0.0f, 1.0f, totalBite * invCount * 4.0f);
+        p.air    = juce::jlimit (0.0f, 1.0f, totalAir * invCount * 8.0f);
+        p.noise  = juce::jlimit (0.0f, 1.0f, totalNoise * invCount * 2.0f);
+        p.motion = juce::jlimit (0.0f, 1.0f, totalMotion * invCount * 0.5f);
+        p.width  = 0.5f;
+        p.space  = juce::jlimit (0.0f, 1.0f, p.air * 0.5f + (1.0f - p.motion) * 0.3f);
+    }
+    
+    return p;
+}
+
+//
+AudioPluginAudioProcessor::TimbreProfile
+AudioPluginAudioProcessor::analyseCurrentBlockToProfile (const juce::AudioBuffer<float>& buffer,
+                                                         double sampleRate)
+{
+    juce::ignoreUnused (sampleRate);
+    TimbreProfile p;
+    
+    if (buffer.getNumSamples() <= 0 || !bandBinsReady)
+        return p;
+    
+    const int nyquistBin = kFFTSize / 2;
+    const float epsilon = 1e-10f;
+    
+    const int brightStartBin = frequencyToBin (4000.0f);
+    const int bodyStartBin   = frequencyToBin (100.0f);
+    const int bodyEndBin     = frequencyToBin (500.0f);
+    const int biteStartBin   = frequencyToBin (1000.0f);
+    const int biteEndBin     = frequencyToBin (4000.0f);
+    const int airStartBin    = frequencyToBin (8000.0f);
+    
+    float totalEnergy = 0.0f;
+    float brightEnergy = 0.0f;
+    float bodyEnergy = 0.0f;
+    float biteEnergy = 0.0f;
+    float airEnergy = 0.0f;
+    
+    std::array<float, kFFTSize / 2 + 1> currentMags {};
+    currentMags.fill (0.0f);
+    
+    for (int bin = 1; bin <= nyquistBin; ++bin)
+    {
+        float re = fftBuffer[(size_t) bin * 2];
+        float im = fftBuffer[(size_t) bin * 2 + 1];
+        float mag = std::sqrt (re * re + im * im);
+        currentMags[(size_t) bin] = mag;
+        
+        float energy = mag * mag;
+        totalEnergy += energy;
+        
+        if (bin >= brightStartBin)
+            brightEnergy += energy;
+        if (bin >= bodyStartBin && bin <= bodyEndBin)
+            bodyEnergy += energy;
+        if (bin >= biteStartBin && bin <= biteEndBin)
+            biteEnergy += energy;
+        if (bin >= airStartBin)
+            airEnergy += energy;
+    }
+    
+    p.bright = (totalEnergy > epsilon)
+        ? juce::jlimit (0.0f, 1.0f, (brightEnergy / totalEnergy) * 3.0f)
+        : 0.0f;
+    
+    p.body = (totalEnergy > epsilon)
+        ? juce::jlimit (0.0f, 1.0f, (bodyEnergy / totalEnergy) * 5.0f)
+        : 0.0f;
+    
+    p.bite = (totalEnergy > epsilon)
+        ? juce::jlimit (0.0f, 1.0f, (biteEnergy / totalEnergy) * 4.0f)
+        : 0.0f;
+    
+    p.air = (totalEnergy > epsilon)
+        ? juce::jlimit (0.0f, 1.0f, (airEnergy / totalEnergy) * 8.0f)
+        : 0.0f;
+    
+    // Noise
+    float sumLog = 0.0f;
+    float sumLinear = 0.0f;
+    for (int bin = 1; bin <= nyquistBin; ++bin)
+    {
+        float mag = currentMags[(size_t) bin] + epsilon;
+        sumLog += std::log (mag);
+        sumLinear += mag;
+    }
+    float geometricMean = std::exp (sumLog / (float) nyquistBin);
+    float arithmeticMean = sumLinear / (float) nyquistBin;
+    p.noise = (arithmeticMean > epsilon)
+        ? juce::jlimit (0.0f, 1.0f, (geometricMean / arithmeticMean) * 2.0f)
+        : 0.0f;
+    
+    // Motion
+    if (hasPreviousFrame)
+    {
+        float motionSum = 0.0f;
+        for (size_t i = 0; i < kBands; ++i)
+        {
+            int bin = (int) (i * (size_t) nyquistBin / kBands) + 1;
+            float diff = std::abs (currentMags[(size_t) bin] - previousFrameEnergy[i]);
+            motionSum += diff;
+        }
+        p.motion = juce::jlimit (0.0f, 1.0f, (motionSum / (float) kBands) * 0.5f);
+    }
+    
+    // Width
+    if (buffer.getNumChannels() >= 2)
+    {
+        const float* left = buffer.getReadPointer (0);
+        const float* right = buffer.getReadPointer (1);
+        
+        float sumLR = 0.0f, sumL2 = 0.0f, sumR2 = 0.0f;
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            sumLR += left[i] * right[i];
+            sumL2 += left[i] * left[i];
+            sumR2 += right[i] * right[i];
+        }
+        
+        float denom = std::sqrt (sumL2 * sumR2) + epsilon;
+        float correlation = sumLR / denom;
+        p.width = juce::jlimit (0.0f, 1.0f, (1.0f - correlation) * 0.5f + 0.25f);
+    }
+    else
+    {
+        p.width = 0.5f;
+    }
+    
+    // Space
+    p.space = juce::jlimit (0.0f, 1.0f, p.air * 0.5f + (1.0f - p.motion) * 0.3f + 0.1f);
+    
+    // 保存当前帧
+    for (size_t i = 0; i < kBands; ++i)
+    {
+        int bin = (int) (i * (size_t) nyquistBin / kBands) + 1;
+        previousFrameEnergy[i] = currentMags[(size_t) bin];
+    }
+    hasPreviousFrame = true;
+    
+    return p;
+}
 
 
 
@@ -216,6 +429,27 @@ std::array<float, 8> AudioPluginAudioProcessor::getTargetProfileArray() const
     return targetProfile.toArray();
 }
 
+std::array<float, 512> AudioPluginAudioProcessor::getSpectrumData() const
+{
+    std::array<float, 512> out {};
+    for (size_t i = 0; i < 512; ++i)
+    {
+        // 从 FFT buffer 获取数据
+        if (i < kFFTSize / 2)
+        {
+            float re = fftBuffer[i * 2];
+            float im = fftBuffer[i * 2 + 1];
+            out[i] = std::sqrt (re * re + im * im);
+        }
+    }
+    return out;
+}
+
+std::array<float, 512> AudioPluginAudioProcessor::getTargetSpectrumData() const
+{
+    return targetSpectrumData;
+}
+
 
 
 //==============================================================================
@@ -338,6 +572,14 @@ void AudioPluginAudioProcessor::buildBandBinMapping()
     bandBinsReady = true;
 }
 
+//辅助函数
+int AudioPluginAudioProcessor::frequencyToBin (float freqHz) const
+{
+    const float nyquist = (float) lastSampleRate * 0.5f;
+    const float clampedFreq = juce::jlimit (0.0f, nyquist, freqHz);
+    return (int) std::round (clampedFreq * (float) kFFTSize / (float) lastSampleRate);
+}
+
 
 
 void AudioPluginAudioProcessor::releaseResources()
@@ -378,11 +620,11 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // 1. 获取输入输出信息
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
-
+    
     // 清理多余输出通道
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
-
+    
     // 2. --- 关键：捕获逻辑 ---
     // 这里使用 atomic 的 load 确保线程安全
     if (isCapturing)
@@ -390,14 +632,14 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         int numSamples = buffer.getNumSamples();
         int remaining = captureLengthSamples - captureWritePos;
         int toCopy = std::min(numSamples, remaining);
-
+        
         if (toCopy > 0)
         {
             // 写入 captureBuffer (单声道)
             captureBuffer.copyFrom(0, captureWritePos, buffer, 0, 0, toCopy);
             captureWritePos += toCopy;
         }
-
+        
         // 检查是否录制结束
         if (captureWritePos >= captureLengthSamples)
         {
@@ -407,6 +649,14 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             targetProfile = analyseBufferToProfile(captureBuffer, lastSampleRate);
             targetReady.store(true);
             statusText = "Target Captured";
+            
+            // 保存 target 频谱数据
+            for (size_t i = 0; i < 512 && i < kFFTSize / 2; ++i)
+            {
+                float re = fftBuffer[i * 2];
+                float im = fftBuffer[i * 2 + 1];
+                targetSpectrumData[i] = std::sqrt(re * re + im * im);
+            }
         }
         else
         {
@@ -414,7 +664,8 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             statusText = "Capturing: " + juce::String((int)((float)captureWritePos / captureLengthSamples * 100)) + "%";
         }
     }
-
+    
+    
     // 3. --- 实时分析逻辑 (Current 列) ---
     // 即使不在录音，我们也需要实时更新 UI 的 Current 数值
     if (totalNumInputChannels > 0)

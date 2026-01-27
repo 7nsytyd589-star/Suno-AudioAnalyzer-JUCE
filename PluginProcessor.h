@@ -66,6 +66,13 @@ public:
 
     AudioPluginAudioProcessor();
     ~AudioPluginAudioProcessor() override = default;
+    
+
+    // 频谱数据获取函数
+    std::array<float, 512> getSpectrumData() const;
+    std::array<float, 512> getTargetSpectrumData() const;
+
+
 
    
    
@@ -118,6 +125,10 @@ private:
     
     TimbreProfile currentProfile;
     std::array<std::atomic<float>, 8> current01; // 0..1
+    
+    // 频谱数据获取函数
+    std::array<std::atomic<float>, 512> spectrumDataAtomic {};
+    std::array<float, 512> targetSpectrumData {};
 
     
     //Capture相关: 抓2秒音频（先只声明，后面实现)
@@ -141,8 +152,17 @@ private:
     
     //
 
-    std::array<float, kBands> targetEnv {};                  // capture后固定一份
+    std::array<float, kBands> targetEnv {};
     juce::SpinLock targetEnvLock;
+    
+    // ====== 音色分析相关 ======
+    // 用于 Motion 计算（帧间变化）
+    std::array<float, kBands> previousFrameEnergy {};
+    bool hasPreviousFrame = false;
+    
+    // 辅助函数
+    int frequencyToBin (float freqHz) const;
+
 
     //
 
